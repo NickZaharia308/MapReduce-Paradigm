@@ -7,6 +7,7 @@
 #include <map>
 #include <sstream>
 #include <cctype>
+#include <algorithm>
 
 using namespace std;
 
@@ -16,7 +17,7 @@ struct mapThreadArgs
     queue<pair<string, int>> *inputFiles;
     pthread_mutex_t *readFromInputFileMutex;
 
-    vector<map<string, int>> *wordMaps;
+    vector<map<string, vector<int>>> *wordMaps;
     pthread_mutex_t *writeWordMapsMutex;
 
     pthread_barrier_t *mapReduceBarrier;
@@ -25,14 +26,42 @@ struct mapThreadArgs
 struct reduceThreadArgs
 {
     int id;
-    vector<map<string, int>> *wordMaps;
-    pthread_mutex_t *readWordMapsMutex;
-
-    map<string, vector<int>> *finalMap;
-    pthread_mutex_t *writeFinalMapMutex;
+    vector<map<string, vector<int>>> *wordMaps;
+    pthread_mutex_t *readWriteWordMapsMutex;
 
     pthread_barrier_t *mapReduceBarrier;
+
+    pthread_mutex_t *writeOutputFilesMutex;
 };
+
+vector<pair<string, vector<int>>> getKeysStartingWith(map<string, vector<int>>& wordMap, char letter) {
+    vector<pair<string, vector<int>>> keyValues;
+
+    // Extract the key-value pairs that start with the given letter
+    for (const auto& keyValue : wordMap) {
+        if (keyValue.first[0] == letter) {
+            keyValues.push_back(keyValue);
+        } else if (keyValue.first[0] > letter) {
+            break;
+        }
+    }
+
+    // Sorting the key-value pairs in descending order by the number of appearances,
+    // then in alphabetical order by the word itself
+    std::sort(keyValues.begin(), keyValues.end(), [](const pair<string, vector<int>>& a, const pair<string, vector<int>>& b) {
+        if (a.second.size() == b.second.size()) {
+            return a.first < b.first;
+        }
+        return a.second.size() > b.second.size();
+    });
+
+    // Erase keys from the map
+    for (const auto& keyValue : keyValues) {
+        wordMap.erase(keyValue.first);
+    }
+
+    return keyValues;
+}
 
 void *reduceFunc(void *arg)
 {
@@ -42,9 +71,76 @@ void *reduceFunc(void *arg)
     pthread_barrier_wait(args->mapReduceBarrier);
 
     // Lock the mutex for reading from the wordMaps for the while loop
-    pthread_mutex_lock(args->readWordMapsMutex);
+    pthread_mutex_lock(args->readWriteWordMapsMutex);
 
-    // If there are 
+    // If there are more than 2 maps, we should merge them
+    while (args->wordMaps->size() > 1) {
+        map<string, vector<int>> firstMap = args->wordMaps->back();
+        args->wordMaps->pop_back();
+
+        map<string, vector<int>> secondMap = args->wordMaps->back();
+        args->wordMaps->pop_back();
+
+        // Unlock the mutex for reading from the wordMaps
+        pthread_mutex_unlock(args->readWriteWordMapsMutex);
+
+        // Merge the 2 maps
+        for (auto word : secondMap) {
+            if (firstMap.find(word.first) == firstMap.end()) {
+                firstMap[word.first] = word.second;
+            } else {
+                firstMap[word.first].insert(firstMap[word.first].end(), word.second.begin(), word.second.end());
+                sort(firstMap[word.first].begin(), firstMap[word.first].end());
+            }
+        }
+
+        // Lock the mutex for writing in the final map
+        pthread_mutex_lock(args->readWriteWordMapsMutex);
+        
+        // Put the merged map in the shared resource map
+        args->wordMaps->push_back(firstMap);
+    }
+
+    // Unlock the mutex for reading from the wordMaps
+    pthread_mutex_unlock(args->readWriteWordMapsMutex);
+
+    const char alphabet[] = "abcdefghijklmnopqrstuvwxyz";
+
+    // Now its time for writing in the output files
+    // Lock the mutex for writing in the output files
+    pthread_mutex_lock(args->writeOutputFilesMutex);
+    for (char letter : alphabet) {
+        vector<pair<string, vector<int>>> keys = getKeysStartingWith(args->wordMaps->back(), letter);
+
+        // Check if the file already exists, if it does, we continue
+        string outputFileName = string(1, letter) + ".txt";
+        if (ifstream(outputFileName)) {
+            continue;
+        }
+        
+
+        ofstream outputFile(outputFileName);
+
+        // // Unlock the mutex for writing in the output files
+        pthread_mutex_unlock(args->writeOutputFilesMutex);
+                
+        for (const auto& key : keys) {
+            outputFile << key.first << ":[";
+            for (size_t i = 0; i < key.second.size(); ++i) {
+                outputFile << key.second[i];
+                if (i != key.second.size() - 1) {
+                    outputFile << " ";
+                }
+            }
+            outputFile << "]" << endl;
+        }
+
+        outputFile.close();
+
+        // // Lock the mutex for checking next chars
+        pthread_mutex_lock(args->writeOutputFilesMutex);
+    }
+    pthread_mutex_unlock(args->writeOutputFilesMutex);
 
     pthread_exit(NULL);
 }
@@ -80,22 +176,21 @@ void *mapFunc(void *arg)
         string currentFileName = currentPair.first;
         int currentFileIndex = currentPair.second;
 
-        cout << "Thread " << args->id << " is processing file " <<currentFileName << " with index " << currentFileIndex << endl;
-
-
         ifstream currentFile(currentFileName);
 
-        map<string, int> wordMap;
+        map<string, vector<int>> wordMap = map<string, vector<int>>();
         string line;
-
+        
         while (getline(currentFile, line)) {
             istringstream lineStream(line);
             string word;
 
             while (lineStream >> word) {
                 string filteredWord = filterWord(word);
-                if (!filteredWord.empty()) {
-                    wordMap[filteredWord] = currentFileIndex;
+                // Add the current file index to the vector of the word
+                // Check if the word is already in the map, the index will stay only one time
+                if (!filteredWord.empty() && wordMap.find(filteredWord) == wordMap.end()) {
+                    wordMap[filteredWord].push_back(currentFileIndex);
                 }
             }
         }
@@ -164,13 +259,12 @@ int main(int argc, char **argv)
 
     // Create the mutex for reading from the wordMaps
     // We don't want more than one thread to try to access the wordMaps and merge them at the same time
-    pthread_mutex_t *readWordMapsMutex = new pthread_mutex_t;
-    pthread_mutex_init(readWordMapsMutex, NULL);
+    pthread_mutex_t *readWriteWordMapsMutex = new pthread_mutex_t;
+    pthread_mutex_init(readWriteWordMapsMutex, NULL);
 
-    // Create the mutex for writing in the final map
-    // We don't want more than one thread to try to write to the final map at the same time
-    pthread_mutex_t *writeFinalMapMutex = new pthread_mutex_t;
-    pthread_mutex_init(writeFinalMapMutex, NULL);
+    // Create the mutex for extracting from the map and writing in the output files
+    pthread_mutex_t *writeOutputFilesMutex = new pthread_mutex_t;
+    pthread_mutex_init(writeOutputFilesMutex, NULL);
 
     // The queue of input files, as a pair of the name of the file and the index of the file
     queue<pair<string, int>> *inputFiles = new queue<pair<string, int>>();
@@ -189,7 +283,7 @@ int main(int argc, char **argv)
     }
 
     // Creating the shared resource between the 2 types of threads
-    vector<map<string, int>> wordMaps = vector<map<string, int>>(0);
+    vector<map<string, vector<int>>> wordMaps = vector<map<string, vector<int>>>();
 
     for (int i = 0; i < noOfMapThreads + noOfReduceThreads; i++)
     {
@@ -202,6 +296,7 @@ int main(int argc, char **argv)
             args->inputFiles = inputFiles;
             args->wordMaps = &wordMaps;
             args->writeWordMapsMutex = writeWordMapsMutex;
+            args->mapReduceBarrier = mapReduceBarrier;
 
             int r = pthread_create(&mapThreads[i], NULL, mapFunc, args);
 
@@ -212,14 +307,13 @@ int main(int argc, char **argv)
         } else {
             reduceThreadArgs *args = new reduceThreadArgs();
             args->id = i;
-            args->readWordMapsMutex = readWordMapsMutex;
+            args->readWriteWordMapsMutex = readWriteWordMapsMutex;
             args->wordMaps = &wordMaps;
 
             map<string, vector<int>> *finalMap = new map<string, vector<int>>();
-            args->finalMap = finalMap;
-            args->writeFinalMapMutex = writeFinalMapMutex;
 
             args->mapReduceBarrier = mapReduceBarrier;
+            args->writeOutputFilesMutex = writeOutputFilesMutex;
 
             int r = pthread_create(&reduceThreads[i - noOfMapThreads], NULL, reduceFunc, args);
 
@@ -231,8 +325,8 @@ int main(int argc, char **argv)
     }
 
     void *status;
-    for (int i = 0; i < noOfMapThreads; i++) {
-		int r = pthread_join(mapThreads[i], &status);
+    for (int i = 0; i < noOfMapThreads + noOfReduceThreads; i++) {
+        int r = pthread_join(i < noOfMapThreads ? mapThreads[i] : reduceThreads[i - noOfMapThreads], &status);
 
 		if (r) {
 			cout << "Error joining thread " << i << endl;
@@ -243,18 +337,22 @@ int main(int argc, char **argv)
     // Destroy the mutexes
     pthread_mutex_destroy(readFromInputFileMutex);
     pthread_mutex_destroy(writeWordMapsMutex);
-    pthread_mutex_destroy(readWordMapsMutex);
-    pthread_mutex_destroy(writeFinalMapMutex);
+    pthread_mutex_destroy(readWriteWordMapsMutex);
+    pthread_mutex_destroy(writeOutputFilesMutex);
 
     // Destroy the barrier
     pthread_barrier_destroy(mapReduceBarrier);
 
     // Write all the values from wordMaps
-    for (auto it = wordMaps.begin(); it != wordMaps.end(); it++) {
-        for (auto it2 = it->begin(); it2 != it->end(); it2++) {
-            cout << it2->first << " " << it2->second << endl;
-        }
-    }
+    // for (auto wordMap : wordMaps) {
+    //     for (auto word : wordMap) {
+    //         cout << word.first << ": ";
+    //         for (auto index : word.second) {
+    //             cout << index << " ";
+    //         }
+    //         cout << endl;
+    //     }
+    // }
 
     return 0;
 }
