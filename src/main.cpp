@@ -32,9 +32,17 @@ struct reduceThreadArgs
     pthread_barrier_t *mapReduceBarrier;
 
     pthread_mutex_t *writeOutputFilesMutex;
+    vector<char> *outputChars;
+
+    pthread_barrier_t *reduceBarrier;
 };
 
 vector<pair<string, vector<int>>> getKeysStartingWith(map<string, vector<int>>& wordMap, char letter) {
+    // Check if wordMap is empty
+    if (wordMap.empty()) {
+        return vector<pair<string, vector<int>>>();
+    }
+
     vector<pair<string, vector<int>>> keyValues;
 
     // Extract the key-value pairs that start with the given letter
@@ -104,25 +112,27 @@ void *reduceFunc(void *arg)
     // Unlock the mutex for reading from the wordMaps
     pthread_mutex_unlock(args->readWriteWordMapsMutex);
 
-    const char alphabet[] = "abcdefghijklmnopqrstuvwxyz";
+    // Wait for all reduce threads to finish
+    pthread_barrier_wait(args->reduceBarrier);
 
     // Now its time for writing in the output files
     // Lock the mutex for writing in the output files
     pthread_mutex_lock(args->writeOutputFilesMutex);
-    for (char letter : alphabet) {
-        vector<pair<string, vector<int>>> keys = getKeysStartingWith(args->wordMaps->back(), letter);
 
-        // Check if the file already exists, if it does, we continue
-        string outputFileName = string(1, letter) + ".txt";
-        if (ifstream(outputFileName)) {
-            continue;
-        }
+    while (!args->outputChars->empty()) {
+        // Get a char from the queue
+        char letter = args->outputChars->front();
         
+        // Remove the char from the queue
+        args->outputChars->erase(args->outputChars->begin());
 
-        ofstream outputFile(outputFileName);
+        vector<pair<string, vector<int>>> keys = getKeysStartingWith(args->wordMaps->front(), letter);
 
-        // // Unlock the mutex for writing in the output files
+        // Unlock the mutex for writing in the output files
         pthread_mutex_unlock(args->writeOutputFilesMutex);
+
+        string outputFileName = string(1, letter) + ".txt";
+        ofstream outputFile(outputFileName);
                 
         for (const auto& key : keys) {
             outputFile << key.first << ":[";
@@ -135,11 +145,13 @@ void *reduceFunc(void *arg)
             outputFile << "]" << endl;
         }
 
+        cout << "Thread " << args->id << " wrote in " << outputFileName << endl;
         outputFile.close();
 
-        // // Lock the mutex for checking next chars
+        // Lock the mutex for checking next chars
         pthread_mutex_lock(args->writeOutputFilesMutex);
     }
+    
     pthread_mutex_unlock(args->writeOutputFilesMutex);
 
     pthread_exit(NULL);
@@ -266,6 +278,10 @@ int main(int argc, char **argv)
     pthread_mutex_t *writeOutputFilesMutex = new pthread_mutex_t;
     pthread_mutex_init(writeOutputFilesMutex, NULL);
 
+    // Create the barrier for reduce threads
+    pthread_barrier_t *reduceBarrier = new pthread_barrier_t;
+    pthread_barrier_init(reduceBarrier, NULL, noOfReduceThreads);
+
     // The queue of input files, as a pair of the name of the file and the index of the file
     queue<pair<string, int>> *inputFiles = new queue<pair<string, int>>();
 
@@ -284,6 +300,13 @@ int main(int argc, char **argv)
 
     // Creating the shared resource between the 2 types of threads
     vector<map<string, vector<int>>> wordMaps = vector<map<string, vector<int>>>();
+
+    // Create the vector with all the english alphabet characters
+    vector<char> outputChars = vector<char>();
+    const char alphabet[] = "abcdefghijklmnopqrstuvwxyz";
+    for (char c : alphabet) {
+        outputChars.push_back(c);
+    }
 
     for (int i = 0; i < noOfMapThreads + noOfReduceThreads; i++)
     {
@@ -315,6 +338,9 @@ int main(int argc, char **argv)
             args->mapReduceBarrier = mapReduceBarrier;
             args->writeOutputFilesMutex = writeOutputFilesMutex;
 
+            args->outputChars = &outputChars;
+            args->reduceBarrier = reduceBarrier;
+
             int r = pthread_create(&reduceThreads[i - noOfMapThreads], NULL, reduceFunc, args);
 
             if (r) {
@@ -342,6 +368,7 @@ int main(int argc, char **argv)
 
     // Destroy the barrier
     pthread_barrier_destroy(mapReduceBarrier);
+    pthread_barrier_destroy(reduceBarrier);
 
     // Write all the values from wordMaps
     // for (auto wordMap : wordMaps) {
