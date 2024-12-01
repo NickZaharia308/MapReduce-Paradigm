@@ -347,7 +347,7 @@ int main(int argc, char **argv)
     // Creating the shared resource between the 2 types of threads
     vector<map<string, vector<int>>> wordMaps = vector<map<string, vector<int>>>();
 
-    // Create the vector with all the english alphabet (lower) characters
+    // Vector with all the english alphabet (lower) characters
     vector<char> outputChars = vector<char>();
     const char alphabet[] = "abcdefghijklmnopqrstuvwxyz";
     for (char c : alphabet) {
