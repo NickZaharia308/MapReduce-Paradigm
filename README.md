@@ -64,10 +64,3 @@ A barrier is placed between the merging of the maps and the writing in the outpu
 
 For writing in the output files, a simillar dynamic heuristic is used.
 If a thread finished writing all the words starting with a letter in an output file, it will try to process the remaining letters.
-
-### Feedback
-
-- Really good homework for understanding parallel programming.
-- Tasks well explained with a good example as well, for me all the tests that worked for the small example worked for the big example as well.
-- Both checkers (local and docker) worked a little bit faulty for me, without modifying anything the points for scalability could be given or not.
-- For me, the Mapper part took under one or two seconds and running with multiple threads didn't improve the time that much, while running from 1->2 Reducers almost halved the time and that could be a reason why the checker didn't work as intended sometimes.
